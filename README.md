@@ -39,6 +39,18 @@
 - 不选章节时下载整本，选章节时只下指定章节；
 - 任务进入**内存队列顺序执行**，侧栏实时显示队列数量与状态。
 
+### 多源搜索与补章
+
+JM 单源常有章节缺失，这一版支持接入第二个站点（当前为**肉漫天堂 `rmtt5.com`**）：
+
+- 搜索时可选「所有源 / JM / 肉漫天堂」，结果标注来源；
+- A 卡填 JM 作品 ID + 补充源作品 ID，点「合并补章」，自动比对两边的**话号**；
+- 以 JM 为主源，主源话号集合里没有的章节才从补充源补齐（实测 355 章 vs 335 章，补 20 章）；
+- 补充章节按 `输出目录/本子名/第N话/` 落盘，和主源目录结构一致；
+- 图片 CDN 会重置连接，直链下载带**重试 + 多域名轮换 + 节流**（实测 90/90 张、零失败）。
+
+> 适配层在 `site_sources.py`，新增站点只需实现 `search / album / chapter_images` 三个方法。
+
 ### 下载控制
 
 | 能力 | 说明 |
@@ -231,10 +243,12 @@ docker run -p 8766:8766 -v $PWD/下载:/app/下载 jmcomic-studio
 | --- | --- | --- |
 | GET | `/` | 单页界面 |
 | GET | `/api/status` | 当前任务、进度、队列、最近 300 行日志 |
-| GET | `/api/album?id=` | 本子详情 + 完整章节目录 |
-| GET | `/api/cover?id=` | 封面代理（JPEG） |
-| POST | `/api/search` | `{query, category, option}` |
-| POST | `/api/start` | `{albums, photos, option, output, format, dry_run, quality, pdf_orientation, skip_bad, keep_raw}` |
+| GET | `/api/album?id=&source=` | 本子详情 + 完整章节目录（source: jm / rmtt） |
+| GET | `/api/merge?id=&source=&extra=` | 跨源合并：主源章节 + 需补充的章节 |
+| GET | `/api/sources` | 可用来源列表 |
+| GET | `/api/cover?id=&source=` | 封面代理（JPEG） |
+| POST | `/api/search` | `{query, category, source, option}` |
+| POST | `/api/start` | `{albums, photos, option, output, format, dry_run, quality, pdf_orientation, skip_bad, keep_raw, supplement, supplement_title}` |
 | POST | `/api/pause` / `resume` / `cancel` | `{id}`，省略 id 时作用于当前任务 |
 | POST | `/api/open-folder` | `{path}`，在资源管理器中打开 |
 
@@ -246,7 +260,8 @@ docker run -p 8766:8766 -v $PWD/下载:/app/下载 jmcomic-studio
 JMComic-Studio/
 ├─ src/jmcomic/
 │  ├─ gui.py            # HTTP 路由 + 单页界面（HTML/CSS/JS 均在此）
-│  ├─ gui_backend.py    # 任务队列、进度、搜索补全、封面代理、PDF/压缩
+│  ├─ gui_backend.py    # 任务队列、进度、搜索补全、封面代理、PDF/压缩、跨源合并
+│  ├─ site_sources.py   # 第二来源适配层（搜索 / 章节 / 图片直链 + 重试）
 │  ├─ jm_downloader.py  # 上游下载内核
 │  └─ ...               # 上游其余模块
 ├─ docs/images/         # README 截图

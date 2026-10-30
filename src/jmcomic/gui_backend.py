@@ -13,6 +13,7 @@ import shutil
 import threading
 import time
 import zipfile
+from html import unescape as html_unescape
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +54,40 @@ def download_result_list(result: Any) -> list[Any]:
     if succeeded is not None:
         return list(succeeded)
     return [result]
+
+
+def pages_iter(page: Any):
+    """Iterate (album_id, title) across jmcomic search page variants."""
+    return page.iter_id_title()
+
+
+_NORMALIZE_RE = re.compile(r'[\s\-_·・:：!！?？,，.。()（）\[\]【】「」『』/\\|]+')
+
+
+_TRAD_TO_SIMP = str.maketrans(
+    '教學祕密漫畫連載話說閱讀點擊喜歡觀看繁體這為與們個時間開關閉話號'
+    '導覽選擇確認識別錯誤載入整理資料夾輸出目錄章節圖片檔案無雙愛戀龍鳳'
+    '爭奪戰國語動態繪畫升級進度結束開始總頁數作者名的',
+    '教学秘密漫画连载话说阅读点击喜欢观看繁体这为与们个时间开关闭话号'
+    '导览选择确认识别错误载入整理资料夹输出目录章节图片档案无双爱恋龙凤'
+    '争夺战国语动态绘画升级进度结束开始总页数作者名的',
+)
+
+
+def normalize_title(title: str) -> str:
+    text = html_unescape(str(title or '')).lower().translate(_TRAD_TO_SIMP)
+    text = _NORMALIZE_RE.sub('', text)
+    return text
+
+
+def _similar_title(left: str, right: str) -> bool:
+    a, b = normalize_title(left), normalize_title(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    return len(shorter) >= 6 and shorter in longer
 
 
 def export_venera(results: list[Any], output_dir: str, keep_raw: bool = False) -> tuple[int, int]:
@@ -344,6 +379,8 @@ class Task:
     pdf_orientation: str = 'auto'
     skip_bad: bool = True
     keep_raw: bool = False
+    supplement: list[dict[str, Any]] = field(default_factory=list)
+    supplement_title: str = ''
     status: str = 'queued'
     logs: list[str] = field(default_factory=list)
     error: str = ''
@@ -370,6 +407,112 @@ class Task:
         return ' / '.join(parts) or '空任务'
 
 
+_ISSUE_PATTERNS = (
+    re.compile(r'第\s*(\d+)\s*[话話章回集]'),
+    re.compile(r'^\s*(\d+)\s*$'),
+    re.compile(r'[\[\(（【]\s*(\d{1,4})\s*[\]\)）】]'),
+    re.compile(r'^\s*(\d{1,4})'),
+)
+_ISSUE_RANGE = re.compile(r'(\d{1,4})\s*[-–~～至到]\s*(\d{1,4})')
+
+
+def parse_issues(name: str) -> list[int]:
+    """Extract issue numbers; ranges like "4-6" expand to [4, 5, 6]."""
+    text = html_unescape(str(name or '')).strip()
+    if not text:
+        return []
+    ranged = _ISSUE_RANGE.search(text)
+    if ranged:
+        start, end = int(ranged.group(1)), int(ranged.group(2))
+        if 0 < start <= end and end - start <= 500:
+            return list(range(start, end + 1))
+    single = parse_issue(text)
+    return [single] if single else []
+
+
+def parse_issue(name: str) -> Optional[int]:
+    """Extract the issue number from chapter names across sources."""
+    text = html_unescape(str(name or '')).strip()
+    if not text:
+        return None
+    for pattern in _ISSUE_PATTERNS:
+        found = pattern.search(text)
+        if found:
+            try:
+                value = int(found.group(1))
+            except ValueError:
+                continue
+            if 0 < value < 100000:
+                return value
+    return None
+
+
+def download_supplement(task: Task, tracker: ProgressTracker, control: Any) -> tuple[int, int]:
+    """Download missing chapters from a secondary plain-HTTP source."""
+    if not task.supplement:
+        return 0, 0
+    from .site_sources import fetch_image
+
+    root = Path(task.output or '.').resolve() / (task.supplement_title or '补充章节')
+    root.mkdir(parents=True, exist_ok=True)
+    chapters = 0
+    images = 0
+    for entry in task.supplement:
+        if control is not None and control.is_cancelled:
+            break
+        chapter_dir = root / safe_name(entry.get('name') or f"第{entry.get('index')}话", 'chapter')
+        chapter_dir.mkdir(parents=True, exist_ok=True)
+        tracker.phase = f"补充章节：{chapter_dir.name}"
+        try:
+            urls = _supplement_urls(entry)
+        except Exception as error:  # noqa: BLE001
+            task.add_log(f'{time.strftime("%H:%M:%S")}  WARNING  补充章节失败：{entry.get("name")}，{error}')
+            continue
+        if not urls:
+            continue
+        tracker.current_chapter = chapter_dir.name
+        tracker.current_index = int(entry.get('index') or 0)
+        with tracker.lock:
+            tracker.images_total += len(urls)
+        ok = 0
+        for index, url in enumerate(urls, start=1):
+            if control is not None and control.is_cancelled:
+                break
+            target = chapter_dir / f'{index:05d}.jpg'
+            if target.exists() and target.stat().st_size > 0:
+                ok += 1
+                with tracker.lock:
+                    tracker.images_done += 1
+                continue
+            try:
+                payload = fetch_image(url)
+                target.write_bytes(payload)
+                ok += 1
+                with tracker.lock:
+                    tracker.images_done += 1
+                    tracker.current_image += 1
+                tracker.add_bytes(len(payload))
+                time.sleep(0.15)
+            except Exception as error:  # noqa: BLE001
+                task.add_log(f'{time.strftime("%H:%M:%S")}  WARNING  图片失败：{url}，{error}')
+            tracker.wait_if_paused()
+        if ok:
+            chapters += 1
+            images += ok
+            with tracker.lock:
+                tracker.chapters_done += 1
+    return chapters, images
+
+
+def _supplement_urls(entry: dict[str, Any]) -> list[str]:
+    from .site_sources import get_source
+
+    source = get_source(entry.get('source') or 'rmtt')
+    if source is None:
+        raise ValueError(f"未知来源：{entry.get('source')}")
+    return source.chapter_images(str(entry.get('comic') or entry.get('album') or ''), str(entry.get('id')))
+
+
 class JobManager:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -386,7 +529,8 @@ class JobManager:
         albums_b, photos_b = parse_ids(str(payload.get('photos', '')))
         albums = list(dict.fromkeys(albums_a + albums_b))
         photos = list(dict.fromkeys(photos_a + photos_b))
-        if not albums and not photos:
+        supplement = list(payload.get('supplement') or [])
+        if not albums and not photos and not supplement:
             raise ValueError('请至少填写一个本子或章节 ID')
         task = Task(
             id=f't{int(time.time() * 1000)}-{os.urandom(2).hex()}',
@@ -400,6 +544,8 @@ class JobManager:
             pdf_orientation=str(payload.get('pdf_orientation') or 'auto'),
             skip_bad=bool(payload.get('skip_bad', True)),
             keep_raw=bool(payload.get('keep_raw', False)),
+            supplement=list(payload.get('supplement') or []),
+            supplement_title=str(payload.get('supplement_title') or ''),
         )
         with self.lock:
             self.tasks.append(task)
@@ -483,6 +629,13 @@ class JobManager:
             failures = sum(len(getattr(item, 'failed', {}) or {}) for item in results)
             if failures and not task.skip_bad:
                 raise RuntimeError(f'{failures} 张图片下载失败（已关闭跳过异常图片）')
+
+            if not control.is_cancelled and task.supplement:
+                tracker.phase = '下载补充章节'
+                extra_chapters, extra_images = download_supplement(task, tracker, control)
+                task.add_log(
+                    f'{time.strftime("%H:%M:%S")}  INFO  补充源完成：{extra_chapters} 章，{extra_images} 张图片'
+                )
 
             image_paths: list[Path] = []
             for item in results:
@@ -636,10 +789,19 @@ class JobManager:
         option = create_option(option_path) if option_path else JmOption.default()
         return option.build_jm_client()
 
-    def search(self, query: str, option_path: str = '', category: str = 'all') -> list[dict[str, Any]]:
+    def search(self, query: str, option_path: str = '', category: str = 'all', source: str = 'all') -> list[dict[str, Any]]:
         query = str(query or '').strip()
         if not query:
             raise ValueError('请输入搜索关键词')
+
+        if source in {'all', 'rmtt'}:
+            extra = self._search_extra(query)
+        else:
+            extra = []
+
+        if source == 'rmtt':
+            return extra[:12]
+
         client = self._client(option_path)
         if category == 'hanman':
             pages = [client.new_jm_client(impl='html').search_site(query, page=1, category='hanman')]
@@ -653,7 +815,7 @@ class JobManager:
         items: list[dict[str, Any]] = []
         seen: set[str] = set()
         for page in pages:
-            for album_id, title in page.iter_id_title():
+            for album_id, title in pages_iter(page):
                 album_id = str(album_id)
                 if album_id in seen:
                     continue
@@ -666,10 +828,28 @@ class JobManager:
                     'pages': None,
                     'chapters': None,
                     'updated': '',
+                    'source': 'jm',
+                    'source_label': 'JM',
                 })
         items = items[:12]
         self._enrich(items, client)
-        return items
+        merged = items + [item for item in extra if not any(
+            _similar_title(item['title'], other.get('title', '')) for other in items)]
+        return merged[:16]
+
+    def _search_extra(self, query: str) -> list[dict[str, Any]]:
+        from .site_sources import SOURCES
+
+        results: list[dict[str, Any]] = []
+        for key, source in SOURCES.items():
+            try:
+                for item in source.search(query):
+                    item['source'] = key
+                    item['source_label'] = getattr(source, 'label', key)
+                    results.append(item)
+            except Exception:
+                continue
+        return results
 
     def _enrich(self, items: list[dict[str, Any]], client) -> None:
         def work(item: dict[str, Any]) -> None:
@@ -687,10 +867,26 @@ class JobManager:
             futures = [pool.submit(work, item) for item in items[:8]]
             wait(futures, timeout=12)
 
-    def album(self, album_id: str) -> dict[str, Any]:
+    def album(self, album_id: str, source: str = 'jm') -> dict[str, Any]:
         album_id = str(album_id or '').strip()
         if not album_id.isdigit():
             raise ValueError('无效的本子 ID')
+        if source and source != 'jm':
+            from .site_sources import get_source
+
+            impl = get_source(source)
+            if impl is None:
+                raise ValueError(f'未知来源：{source}')
+            data = impl.album(album_id)
+            data['source'] = source
+            data['source_label'] = getattr(impl, 'label', source)
+            data['episodes'] = [
+                {'id': str(ch['key']), 'index': str(ch['index']), 'name': ch['name']}
+                for ch in data.pop('chapters_list', [])
+            ]
+            data['cover'] = f'/api/cover?source={source}&id={album_id}'
+            return data
+
         now = time.time()
         cached = self.album_cache.get(album_id)
         if cached and now - cached[0] < 900:
@@ -704,6 +900,8 @@ class JobManager:
             'chapters': len(album),
             'updated': str(album.update_date or ''),
             'cover': f'/api/cover?id={album_id}',
+            'source': 'jm',
+            'source_label': 'JM',
             'episodes': [
                 {'id': str(pid), 'index': str(index), 'name': str(name)}
                 for pid, index, name in album.episode_list
@@ -712,26 +910,92 @@ class JobManager:
         self.album_cache[album_id] = (now, data)
         return data
 
-    def cover(self, album_id: str) -> bytes:
+    def merge(self, jm_id: str, extra_source: str = 'rmtt', extra_id: str = '') -> dict[str, Any]:
+        """Merge chapter lists by issue number, primary source first.
+
+        JM 的章节名是纯数字（322、323…），rmtt 是「第N话-标题」，因此不能按标题
+        对齐，只能抽出「话号」后取并集：主源保留自己的话，次源只补主源没有的话号。
+        """
+        jm_id = str(jm_id or '').strip()
+        extra_id = str(extra_id or '').strip()
+        primary = self.album(jm_id, 'jm') if jm_id.isdigit() else None
+        secondary = None
+        if extra_id:
+            try:
+                secondary = self.album(extra_id, extra_source)
+            except Exception:
+                secondary = None
+
+        episodes = list(primary.get('episodes', [])) if primary else []
+        primary_issues: set[int] = set()
+        for ep in episodes:
+            primary_issues.update(parse_issues(ep.get('name', '')))
+        primary_max = max(primary_issues) if primary_issues else 0
+
+        supplement: list[dict[str, Any]] = []
+        if secondary:
+            seen_extra: set[int] = set()
+            for ep in secondary.get('episodes', []):
+                issues = parse_issues(ep.get('name', ''))
+                if not issues:
+                    continue
+                issue = issues[0]
+                if issue in primary_issues or issue in seen_extra:
+                    continue
+                seen_extra.add(issue)
+                supplement.append({
+                    'id': ep.get('id', ''),
+                    'index': issue,
+                    'name': ep.get('name', ''),
+                    'source': secondary.get('source', extra_source),
+                    'comic': str(extra_id),
+                })
+            supplement.sort(key=lambda item: item['index'])
+
+        stats = {
+            'primary_count': len(episodes),
+            'primary_max_issue': primary_max,
+            'secondary_count': len(secondary.get('episodes', [])) if secondary else 0,
+            'supplement_count': len(supplement),
+        }
+        return {
+            'primary': primary,
+            'secondary': secondary,
+            'episodes': episodes,
+            'supplement': supplement,
+            'stats': stats,
+        }
+
+    def cover(self, album_id: str, source: str = 'jm') -> bytes:
         album_id = str(album_id or '').strip()
         if not album_id.isdigit():
             raise ValueError('无效的本子 ID')
-        cached = self.cover_cache.get(album_id)
+        cache_key = f'{source}:{album_id}'
+        cached = self.cover_cache.get(cache_key)
         if cached:
             return cached
-        url = JmcomicText.get_album_cover_url(album_id)
-        from curl_cffi import requests as curl_requests
-        response = curl_requests.get(
-            url,
-            impersonate='chrome',
-            timeout=20,
-            headers={'Referer': 'https://18comic.vip/'},
-        )
-        if response.status_code != 200 or not response.content:
-            raise RuntimeError(f'封面获取失败：HTTP {response.status_code}')
-        content = bytes(response.content)
+        if source and source != 'jm':
+            from .site_sources import get_source
+
+            impl = get_source(source)
+            if impl is None:
+                raise ValueError(f'未知来源：{source}')
+            content = impl.cover(album_id)
+        else:
+            url = JmcomicText.get_album_cover_url(album_id)
+            from curl_cffi import requests as curl_requests
+            response = curl_requests.get(
+                url,
+                impersonate='chrome',
+                timeout=20,
+                headers={'Referer': 'https://18comic.vip/'},
+            )
+            if response.status_code != 200 or not response.content:
+                raise RuntimeError(f'封面获取失败：HTTP {response.status_code}')
+            content = bytes(response.content)
         if len(self.cover_cache) > 200:
             self.cover_cache.clear()
-        self.cover_cache[album_id] = content
+        self.cover_cache[cache_key] = content
         return content
+
 

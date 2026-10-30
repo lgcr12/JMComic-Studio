@@ -684,21 +684,37 @@ HTML = r'''<!doctype html>
               <button type="button" data-category="hanman">韩漫</button>
               <button type="button" data-category="japanese">日漫</button>
             </div>
+            <div id="sourceFilter" class="seg" role="group" style="margin-left:6px">
+              <button type="button" data-source="all" class="active">所有源</button>
+              <button type="button" data-source="jm">JM</button>
+              <button type="button" data-source="rmtt">肉漫天堂</button>
+            </div>
           </div>
           <div id="searchResults" class="results"><div class="empty-note">输入名称后搜索，或者直接在右侧填入本子 ID。</div></div>
         </section>
 
         <section class="config">
           <div class="card card-a">
-            <div class="card-head"><h3><span class="badge">A</span>任务来源</h3><span class="meta">本子 ID</span></div>
+            <div class="card-head"><h3><span class="badge">A</span>任务来源</h3><span class="meta">多源合并</span></div>
             <div class="card-body">
               <div class="field">
                 <label for="albums">作品 ID</label>
                 <div class="path-row">
                   <input id="albums" type="text" placeholder="每行一个，例如 1114751">
-                  <button id="loadAlbum" class="mini-btn" type="button">搜索作品</button>
+                  <button id="loadAlbum" class="mini-btn" type="button">读取</button>
                 </div>
               </div>
+              <div class="row-2" style="margin-top:10px">
+                <div class="field">
+                  <label for="extraUrl">补充源作品</label>
+                  <input id="extraUrl" type="text" placeholder="肉漫天堂 ID 或 链接">
+                </div>
+                <div class="field">
+                  <label>&nbsp;</label>
+                  <button id="mergeBtn" class="mini-btn" type="button" style="width:100%">合并补章</button>
+                </div>
+              </div>
+              <div id="mergeInfo" class="hint" style="margin-top:8px">填写 JM 作品 ID 与补充源 ID，点「合并补章」后缺章会自动从补充源补齐。</div>
               <div class="row-2" style="margin-top:10px">
                 <div class="field">
                   <label for="option">选择文件（可选）</label>
@@ -884,7 +900,8 @@ HTML = r'''<!doctype html>
   <script>
     const $ = (id) => document.getElementById(id);
     let running = false, paused = false, pollTimer = null, seenLogs = 0;
-    let outputFormat = 'jpg', searchCategory = 'all', albumData = null, quality = 100;
+    let outputFormat = 'jpg', searchCategory = 'all', searchSource = 'all', albumData = null, quality = 100;
+    let mergedSupplement = [];
     let pdfOrientation = 'auto', skipBad = true, keepRaw = false;
     let islandState = 'idle', hideTimer = null, lastLogs = [];
 
@@ -1059,10 +1076,18 @@ HTML = r'''<!doctype html>
       $('resultCount').textContent = '共 ' + items.length + ' 个';
       $('searchResults').innerHTML = items.map((item) => {
         const meta = [item.author, item.chapters ? item.chapters + ' 章' : '', item.pages ? item.pages.toLocaleString() + ' 页' : ''].filter(Boolean).join(' · ');
-        return `<button class="result-item" type="button" data-id="${escapeHtml(item.id)}"><img class="cover" loading="lazy" src="${escapeHtml(item.cover)}" alt="" onerror="this.style.display='none'"><span class="result-main"><span class="result-title">${escapeHtml(item.title || '未命名')}</span><span class="result-meta">${escapeHtml(meta || ('JM' + item.id))}</span></span><span class="result-arrow">›</span></button>`;
+        const tag = item.source && item.source !== 'jm'
+          ? `<span class="pill" style="margin-left:6px">${escapeHtml(item.source_label || item.source)}</span>`
+          : '';
+        return `<button class="result-item" type="button" data-id="${escapeHtml(item.id)}" data-source="${escapeHtml(item.source || 'jm')}" data-title="${escapeHtml(item.title || '')}"><img class="cover" loading="lazy" src="${escapeHtml(item.cover)}" alt="" onerror="this.style.display='none'"><span class="result-main"><span class="result-title">${escapeHtml(item.title || '未命名')}${tag}</span><span class="result-meta">${escapeHtml(meta || ((item.source === 'jm' ? 'JM' : '') + item.id))}</span></span><span class="result-arrow">›</span></button>`;
       }).join('');
       $('searchResults').querySelectorAll('.result-item').forEach((node) => node.addEventListener('click', () => {
-        $('albums').value = node.dataset.id;
+        const source = node.dataset.source || 'jm';
+        if (source === 'jm') {
+          $('albums').value = node.dataset.id;
+        } else {
+          $('extraUrl').value = node.dataset.id;
+        }
         refreshCounts();
         loadAlbum();
       }));
@@ -1075,7 +1100,7 @@ HTML = r'''<!doctype html>
       $('resultCount').textContent = '搜索中…';
       $('searchResults').innerHTML = '<div class="empty-note">正在搜索并获取详情，稍等几秒…</div>';
       try {
-        const response = await fetch('/api/search', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({query, category: searchCategory, option: $('option').value.trim()})});
+        const response = await fetch('/api/search', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({query, category: searchCategory, source: searchSource, option: $('option').value.trim()})});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || '搜索失败');
         if (!data.results.length) { $('searchResults').innerHTML = '<div class="empty-note">没有找到匹配结果。</div>'; $('resultCount').textContent = '0 个'; return; }
@@ -1130,6 +1155,31 @@ HTML = r'''<!doctype html>
       }
     };
 
+    const mergeAlbum = async () => {
+      const jmId = split($('albums').value).find((x) => /^\d+$/.test(x));
+      const extraRaw = $('extraUrl').value.trim();
+      const extraId = (extraRaw.match(/(\d{3,})/) || [])[1] || '';
+      if (!jmId) { $('mergeInfo').textContent = '先在上方填入 JM 作品 ID'; return; }
+      if (!extraId) { $('mergeInfo').textContent = '请在「补充源作品」里填肉漫天堂的作品 ID 或链接'; return; }
+      $('mergeInfo').textContent = '正在比对两边的章节…';
+      try {
+        const data = await fetch(`/api/merge?id=${encodeURIComponent(jmId)}&source=rmtt&extra=${encodeURIComponent(extraId)}`).then((r) => r.json());
+        if (data.error) throw new Error(data.error);
+        mergedSupplement = data.supplement || [];
+        const primary = data.primary || {};
+        const secondary = data.secondary || {};
+        const stats = data.stats || {};
+        $('mergeInfo').innerHTML = `主源 ${escapeHtml(primary.source_label || 'JM')} <b>${primary.chapters || 0}</b> 章 · 补充源 ${escapeHtml(secondary.source_label || '肉漫天堂')} <b>${secondary.chapters || 0}</b> 章 · 需补 <b>${mergedSupplement.length}</b> 章`;
+        if (mergedSupplement.length) {
+          const preview = mergedSupplement.slice(0, 3).map((x) => `第${x.index}话`).join('、');
+          $('mergeInfo').textContent += `（${preview}${mergedSupplement.length > 3 ? ' 等' : ''}）`;
+        }
+      } catch (error) {
+        mergedSupplement = [];
+        $('mergeInfo').textContent = `合并失败：${error.message}`;
+      }
+    };
+
     const openFolder = async () => {
       const path = $('output').value.trim() || '下载';
       try {
@@ -1150,7 +1200,7 @@ HTML = r'''<!doctype html>
         $('log').innerHTML = '<div class="log-row warn"><span class="lt">--:--:--</span><span class="lv">WARNING</span><span class="lm">请至少填写一个本子或章节。</span></div>';
         return;
       }
-      const payload = { albums, photos, option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: Boolean(isPreview), quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw };
+      const payload = { albums, photos, option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: Boolean(isPreview), quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw, supplement: mergedSupplement, supplement_title: (albumData && albumData.title) || '' };
       const response = await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
       const data = await response.json();
       if (!response.ok) {
@@ -1190,6 +1240,11 @@ HTML = r'''<!doctype html>
       searchCategory = button.dataset.category;
       document.querySelectorAll('#searchFilter button').forEach((other) => other.classList.toggle('active', other === button));
     }));
+    document.querySelectorAll('#sourceFilter button').forEach((button) => button.addEventListener('click', () => {
+      searchSource = button.dataset.source;
+      document.querySelectorAll('#sourceFilter button').forEach((other) => other.classList.toggle('active', other === button));
+    }));
+    $('mergeBtn').addEventListener('click', mergeAlbum);
     $('quality').addEventListener('input', () => { quality = Number($('quality').value); $('qualityValue').textContent = quality + '%'; });
     $('skipBad').addEventListener('change', () => { skipBad = $('skipBad').checked; });
     $('keepRaw').addEventListener('change', () => { keepRaw = $('keepRaw').checked; });
@@ -1204,6 +1259,8 @@ HTML = r'''<!doctype html>
       $('albums').value = ''; $('photos').value = ''; $('option').value = ''; $('output').value = '下载';
       $('chapterBox').innerHTML = ''; $('chapterMeta').textContent = '未加载'; $('chapterHint').textContent = '未选择时下载全部章节';
       $('albumCard').classList.remove('show'); albumData = null;
+      mergedSupplement = []; $('extraUrl').value = '';
+      $('mergeInfo').textContent = '填写 JM 作品 ID 与补充源 ID，点「合并补章」后缺章会自动从补充源补齐。';
       document.querySelector('input[name="scope"][value="all"]').checked = true;
       outputFormat = 'jpg'; document.querySelectorAll('#formatToggle button').forEach((b) => b.classList.toggle('active', b.dataset.format === 'jpg'));
       $('infoFormat').textContent = 'JPG';
@@ -1433,17 +1490,40 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == '/api/album':
             album_id = (query.get('id') or [''])[0]
+            source = (query.get('source') or ['jm'])[0]
             try:
-                self._json(JOB.album(album_id))
+                self._json(JOB.album(album_id, source))
             except ValueError as error:
                 self._json({'error': str(error)}, HTTPStatus.BAD_REQUEST)
             except Exception as error:  # noqa: BLE001
                 self._json({'error': f'获取本子信息失败：{error}'}, HTTPStatus.BAD_GATEWAY)
             return
+        if path == '/api/merge':
+            try:
+                self._json(JOB.merge(
+                    (query.get('id') or [''])[0],
+                    (query.get('source') or ['rmtt'])[0],
+                    (query.get('extra') or [''])[0],
+                ))
+            except ValueError as error:
+                self._json({'error': str(error)}, HTTPStatus.BAD_REQUEST)
+            except Exception as error:  # noqa: BLE001
+                self._json({'error': f'合并失败：{error}'}, HTTPStatus.BAD_GATEWAY)
+            return
+        if path == '/api/sources':
+            from .site_sources import SOURCES
+
+            self._json({
+                'sources': [{'key': 'jm', 'label': 'JM'}] + [
+                    {'key': key, 'label': getattr(item, 'label', key)} for key, item in SOURCES.items()
+                ]
+            })
+            return
         if path == '/api/cover':
             album_id = (query.get('id') or [''])[0]
+            source = (query.get('source') or ['jm'])[0]
             try:
-                self._send(JOB.cover(album_id), 'image/jpeg', HTTPStatus.OK)
+                self._send(JOB.cover(album_id, source), 'image/jpeg', HTTPStatus.OK)
             except Exception as error:  # noqa: BLE001
                 self._json({'error': str(error)}, HTTPStatus.NOT_FOUND)
             return
@@ -1458,6 +1538,7 @@ class _Handler(BaseHTTPRequestHandler):
                     str(payload.get('query', '')),
                     str(payload.get('option', '')).strip(),
                     str(payload.get('category', 'all')).strip().lower(),
+                    str(payload.get('source', 'all')).strip().lower(),
                 )
                 self._json({'results': results})
             except (ValueError, RuntimeError) as error:
