@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+下载/
+downloads/
+Venera-导入/
+*.bak
+.DS_Store
