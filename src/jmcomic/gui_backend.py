@@ -95,6 +95,53 @@ def _similar_title(left: str, right: str) -> bool:
     return len(shorter) >= 6 and shorter in longer
 
 
+def _chapter_issue(chapter: str) -> int:
+    """Issue number from a chapter folder name; falls back to the trailing digits."""
+    issues = parse_issues(chapter)
+    if issues:
+        return issues[0]
+    numbers = re.findall(r'(\d{1,4})', chapter)
+    return int(numbers[-1]) if numbers else 10 ** 9
+
+
+def _zip_sort_key(arcname: str) -> tuple:
+    """Sort Venera entries by issue number, then chapter name, then file name."""
+    parts = arcname.split('/')
+    chapter = parts[1] if len(parts) > 1 else ''
+    issue = _chapter_issue(chapter)
+    rest = parts[2] if len(parts) > 2 else ''
+    return (issue, natural_sort_key(chapter), natural_sort_key(rest))
+
+
+def rebuild_zip_sorted(path: Path, extra: dict[str, Path] | None = None) -> int:
+    """Rewrite a zip with entries ordered by issue number.
+
+    LocalSend/Venera 按压缩包条目顺序展示章节，追加写入会把补章排到末尾，
+    因此这里统一重建：读取已有条目 + 新文件，按话号排序后写回。
+    """
+    extra = extra or {}
+    if not path.exists() and not extra:
+        return 0
+    temp = path.with_name(path.name + '.sorted.tmp')
+    names: list[str] = []
+    with zipfile.ZipFile(path) as source:
+        names = [info.filename for info in source.infolist()]
+    names = sorted(set(names) | set(extra), key=_zip_sort_key)
+    count = 0
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(temp, 'w', compression=zipfile.ZIP_STORED) as target:
+        existing = {info.filename: info for info in source.infolist()}
+        for name in names:
+            if name in extra:
+                target.write(extra[name], name)
+            else:
+                info = existing[name]
+                with source.open(info) as src, target.open(info, 'w') as dst:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
+            count += 1
+    os.replace(temp, path)
+    return count
+
+
 def _unique_zip_path(base: Path) -> Path:
     """Return a non-existing sibling path like "name (2).zip"."""
     index = 2
@@ -166,7 +213,8 @@ def export_venera(results: list[Any], output_dir: str, keep_raw: bool = False) -
         with zipfile.ZipFile(temp_archive, 'w', compression=zipfile.ZIP_STORED) as archive:
             for file_path in sorted(
                     staging_dir.rglob('*'),
-                    key=lambda path: natural_sort_key(path.relative_to(staging_dir))):
+                    key=lambda path: _zip_sort_key(
+                        f"{comic['name']}/{path.relative_to(staging_dir).as_posix()}")):
                 if file_path.is_file() and file_path.suffix.lower() in _IMAGE_SUFFIXES:
                     archive.write(file_path, Path(comic['name']) / file_path.relative_to(staging_dir))
         # Venera 或杀软可能正占用目标 ZIP，替换失败时重试并退回唯一文件名
@@ -495,41 +543,31 @@ def parse_issue(name: str) -> Optional[int]:
 
 
 def export_supplement_zip(comic_title: str, chapter_dirs: list[Path], output_dir: str) -> tuple[Path, int]:
-    """Append supplement chapters to the comic's Venera zip (create if missing)."""
+    """Merge supplement chapters into the comic's Venera zip, keeping issue order."""
     if not chapter_dirs:
         return Path(), 0
     export_root = Path(output_dir or '.').resolve().parent / 'Venera-导入'
     export_root.mkdir(parents=True, exist_ok=True)
     comic_name = safe_name(comic_title, 'comic')
     archive_path = export_root / f'[JM{comic_name}].zip'
-    added = 0
-    mode = 'a' if archive_path.exists() else 'w'
+
+    entries: dict[str, Path] = {}
+    for chapter_dir in chapter_dirs:
+        chapter_name = safe_name(chapter_dir.name, 'chapter')
+        for file in sorted(chapter_dir.iterdir(), key=lambda p: natural_sort_key(p.name)):
+            if not file.is_file() or file.suffix.lower() not in _IMAGE_SUFFIXES:
+                continue
+            entries[f'{comic_name}/{chapter_name}/{file.name}'] = file
+    if not entries:
+        return archive_path, 0
+
     try:
-        with zipfile.ZipFile(archive_path, mode, compression=zipfile.ZIP_STORED) as archive:
-            existing = set(archive.namelist()) if mode == 'a' else set()
-            for chapter_dir in chapter_dirs:
-                chapter_name = safe_name(chapter_dir.name, 'chapter')
-                for file in sorted(chapter_dir.iterdir(), key=lambda p: natural_sort_key(p.name)):
-                    if not file.is_file() or file.suffix.lower() not in _IMAGE_SUFFIXES:
-                        continue
-                    arcname = f'{comic_name}/{chapter_name}/{file.name}'
-                    if arcname in existing:
-                        continue
-                    archive.write(file, arcname)
-                    existing.add(arcname)
-                    added += 1
+        rebuild_zip_sorted(archive_path, entries)
     except PermissionError:
         # 目标 ZIP 被占用（Venera 正在导入 / 杀软扫描），改写唯一文件名，避免整任务失败
         archive_path = _unique_zip_path(export_root / f'[JM{comic_name}].zip')
-        with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_STORED) as archive:
-            for chapter_dir in chapter_dirs:
-                chapter_name = safe_name(chapter_dir.name, 'chapter')
-                for file in sorted(chapter_dir.iterdir(), key=lambda p: natural_sort_key(p.name)):
-                    if not file.is_file() or file.suffix.lower() not in _IMAGE_SUFFIXES:
-                        continue
-                    archive.write(file, f'{comic_name}/{chapter_name}/{file.name}')
-                    added += 1
-    return archive_path, added
+        rebuild_zip_sorted(archive_path, entries)
+    return archive_path, len(entries)
 
 
 def download_supplement(task: Task, tracker: ProgressTracker, control: Any) -> tuple[int, int, list[Path]]:
