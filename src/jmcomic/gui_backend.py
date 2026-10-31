@@ -452,33 +452,70 @@ def parse_issue(name: str) -> Optional[int]:
     return None
 
 
-def download_supplement(task: Task, tracker: ProgressTracker, control: Any) -> tuple[int, int]:
+def export_supplement_zip(comic_title: str, chapter_dirs: list[Path], output_dir: str) -> tuple[Path, int]:
+    """Append supplement chapters to the comic's Venera zip (create if missing)."""
+    if not chapter_dirs:
+        return Path(), 0
+    export_root = Path(output_dir or '.').resolve().parent / 'Venera-导入'
+    export_root.mkdir(parents=True, exist_ok=True)
+    comic_name = safe_name(comic_title, 'comic')
+    archive_path = export_root / f'[JM{comic_name}].zip'
+    added = 0
+    mode = 'a' if archive_path.exists() else 'w'
+    with zipfile.ZipFile(archive_path, mode, compression=zipfile.ZIP_STORED) as archive:
+        existing = set(archive.namelist()) if mode == 'a' else set()
+        for chapter_dir in chapter_dirs:
+            chapter_name = safe_name(chapter_dir.name, 'chapter')
+            for file in sorted(chapter_dir.iterdir(), key=lambda p: natural_sort_key(p.name)):
+                if not file.is_file() or file.suffix.lower() not in _IMAGE_SUFFIXES:
+                    continue
+                arcname = f'{comic_name}/{chapter_name}/{file.name}'
+                if arcname in existing:
+                    continue
+                archive.write(file, arcname)
+                existing.add(arcname)
+                added += 1
+    return archive_path, added
+
+
+def download_supplement(task: Task, tracker: ProgressTracker, control: Any) -> tuple[int, int, list[Path]]:
     """Download missing chapters from a secondary plain-HTTP source."""
     if not task.supplement:
-        return 0, 0
+        return 0, 0, []
     from .site_sources import fetch_image
 
     root = Path(task.output or '.').resolve() / safe_name(task.supplement_title, '补充章节')
     root.mkdir(parents=True, exist_ok=True)
     chapters = 0
     images = 0
+    dirs: list[Path] = []
+
+    # 先把所有待补章节的图片清单取齐，再一次性把总量加到进度里，
+    # 避免下载过程中分母不断增长、出现 361/355 这种越下越多的情况。
+    tracker.phase = '统计补充章节'
+    planned: list[tuple[dict[str, Any], list[str]]] = []
     for entry in task.supplement:
         if control is not None and control.is_cancelled:
             break
-        chapter_dir = root / safe_name(entry.get('name') or f"第{entry.get('index')}话", 'chapter')
-        chapter_dir.mkdir(parents=True, exist_ok=True)
-        tracker.phase = f"补充章节：{chapter_dir.name}"
         try:
             urls = _supplement_urls(entry)
         except Exception as error:  # noqa: BLE001
             task.add_log(f'{time.strftime("%H:%M:%S")}  WARNING  补充章节失败：{entry.get("name")}，{error}')
             continue
-        if not urls:
-            continue
+        if urls:
+            planned.append((entry, urls))
+    with tracker.lock:
+        tracker.chapters_total += len(planned)
+        tracker.images_total += sum(len(urls) for _, urls in planned)
+
+    for entry, urls in planned:
+        if control is not None and control.is_cancelled:
+            break
+        chapter_dir = root / safe_name(entry.get('name') or f"第{entry.get('index')}话", 'chapter')
+        chapter_dir.mkdir(parents=True, exist_ok=True)
+        tracker.phase = f"补充章节：{chapter_dir.name}"
         tracker.current_chapter = chapter_dir.name
         tracker.current_index = int(entry.get('index') or 0)
-        with tracker.lock:
-            tracker.images_total += len(urls)
         ok = 0
         for index, url in enumerate(urls, start=1):
             if control is not None and control.is_cancelled:
@@ -504,9 +541,10 @@ def download_supplement(task: Task, tracker: ProgressTracker, control: Any) -> t
         if ok:
             chapters += 1
             images += ok
+            dirs.append(chapter_dir)
             with tracker.lock:
                 tracker.chapters_done += 1
-    return chapters, images
+    return chapters, images, dirs
 
 
 def _supplement_urls(entry: dict[str, Any]) -> list[str]:
@@ -637,10 +675,19 @@ class JobManager:
 
             if not control.is_cancelled and task.supplement:
                 tracker.phase = '下载补充章节'
-                extra_chapters, extra_images = download_supplement(task, tracker, control)
+                extra_chapters, extra_images, extra_dirs = download_supplement(task, tracker, control)
                 task.add_log(
                     f'{time.strftime("%H:%M:%S")}  INFO  补充源完成：{extra_chapters} 章，{extra_images} 张图片'
                 )
+                if extra_dirs and not control.is_cancelled:
+                    tracker.phase = '打包补充章节'
+                    zip_path, packed = export_supplement_zip(
+                        task.supplement_title, extra_dirs, task.output or os.getcwd()
+                    )
+                    if packed:
+                        task.add_log(
+                            f'{time.strftime("%H:%M:%S")}  INFO  Venera 压缩包已更新：{zip_path.name}（新增 {packed} 张）'
+                        )
 
             image_paths: list[Path] = []
             for item in results:
