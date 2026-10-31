@@ -14,7 +14,7 @@ import threading
 import time
 import zipfile
 from html import unescape as html_unescape
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
