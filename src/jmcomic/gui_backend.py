@@ -95,6 +95,16 @@ def _similar_title(left: str, right: str) -> bool:
     return len(shorter) >= 6 and shorter in longer
 
 
+def _unique_zip_path(base: Path) -> Path:
+    """Return a non-existing sibling path like "name (2).zip"."""
+    index = 2
+    while True:
+        candidate = base.with_name(f'{base.stem} ({index}){base.suffix}')
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def export_venera(results: list[Any], output_dir: str, keep_raw: bool = False) -> tuple[int, int]:
     """Create one Venera-compatible ZIP archive per downloaded comic."""
     if not results:
@@ -159,8 +169,19 @@ def export_venera(results: list[Any], output_dir: str, keep_raw: bool = False) -
                     key=lambda path: natural_sort_key(path.relative_to(staging_dir))):
                 if file_path.is_file() and file_path.suffix.lower() in _IMAGE_SUFFIXES:
                     archive.write(file_path, Path(comic['name']) / file_path.relative_to(staging_dir))
-        os.replace(temp_archive, archive_path)
-        shutil.rmtree(staging_dir)
+        # Venera 或杀软可能正占用目标 ZIP，替换失败时重试并退回唯一文件名
+        final_path = archive_path
+        for attempt in range(6):
+            try:
+                os.replace(temp_archive, final_path)
+                break
+            except (PermissionError, OSError):
+                if attempt == 5:
+                    final_path = _unique_zip_path(archive_path)
+                    os.replace(temp_archive, final_path)
+                    break
+                time.sleep(0.6)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     if keep_raw:
         return len(comics), copied
@@ -306,6 +327,26 @@ class ProgressTracker:
             }
 
 
+_ACTIVE_TITLES: dict[int, str] = {}
+
+
+def _photo_name_advice(photo):
+    """Use the merged chapter title (from the secondary source) as folder name."""
+    title = _ACTIVE_TITLES.get(getattr(photo, 'album_index', -1))
+    if not title:
+        return photo.name
+    album = getattr(photo, 'from_album', None)
+    prefix = getattr(album, 'name', '') if album is not None else ''
+    if prefix and prefix not in title:
+        return f'{prefix} {title}'
+    return title
+
+
+from .jm_config import JmModuleConfig  # noqa: E402
+
+JmModuleConfig.PFIELD_ADVICE['name'] = _photo_name_advice
+
+
 class GuiDownloader(JmDownloader):
     """JmDownloader that reports structured progress to a tracker."""
 
@@ -386,6 +427,7 @@ class Task:
     keep_raw: bool = False
     supplement: list[dict[str, Any]] = field(default_factory=list)
     supplement_title: str = ''
+    title_map: dict[int, str] = field(default_factory=dict)
     status: str = 'queued'
     logs: list[str] = field(default_factory=list)
     error: str = ''
@@ -462,19 +504,31 @@ def export_supplement_zip(comic_title: str, chapter_dirs: list[Path], output_dir
     archive_path = export_root / f'[JM{comic_name}].zip'
     added = 0
     mode = 'a' if archive_path.exists() else 'w'
-    with zipfile.ZipFile(archive_path, mode, compression=zipfile.ZIP_STORED) as archive:
-        existing = set(archive.namelist()) if mode == 'a' else set()
-        for chapter_dir in chapter_dirs:
-            chapter_name = safe_name(chapter_dir.name, 'chapter')
-            for file in sorted(chapter_dir.iterdir(), key=lambda p: natural_sort_key(p.name)):
-                if not file.is_file() or file.suffix.lower() not in _IMAGE_SUFFIXES:
-                    continue
-                arcname = f'{comic_name}/{chapter_name}/{file.name}'
-                if arcname in existing:
-                    continue
-                archive.write(file, arcname)
-                existing.add(arcname)
-                added += 1
+    try:
+        with zipfile.ZipFile(archive_path, mode, compression=zipfile.ZIP_STORED) as archive:
+            existing = set(archive.namelist()) if mode == 'a' else set()
+            for chapter_dir in chapter_dirs:
+                chapter_name = safe_name(chapter_dir.name, 'chapter')
+                for file in sorted(chapter_dir.iterdir(), key=lambda p: natural_sort_key(p.name)):
+                    if not file.is_file() or file.suffix.lower() not in _IMAGE_SUFFIXES:
+                        continue
+                    arcname = f'{comic_name}/{chapter_name}/{file.name}'
+                    if arcname in existing:
+                        continue
+                    archive.write(file, arcname)
+                    existing.add(arcname)
+                    added += 1
+    except PermissionError:
+        # 目标 ZIP 被占用（Venera 正在导入 / 杀软扫描），改写唯一文件名，避免整任务失败
+        archive_path = _unique_zip_path(export_root / f'[JM{comic_name}].zip')
+        with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_STORED) as archive:
+            for chapter_dir in chapter_dirs:
+                chapter_name = safe_name(chapter_dir.name, 'chapter')
+                for file in sorted(chapter_dir.iterdir(), key=lambda p: natural_sort_key(p.name)):
+                    if not file.is_file() or file.suffix.lower() not in _IMAGE_SUFFIXES:
+                        continue
+                    archive.write(file, f'{comic_name}/{chapter_name}/{file.name}')
+                    added += 1
     return archive_path, added
 
 
@@ -593,6 +647,11 @@ class JobManager:
             keep_raw=bool(payload.get('keep_raw', False)),
             supplement=list(payload.get('supplement') or []),
             supplement_title=str(payload.get('supplement_title') or ''),
+            title_map={
+                int(key): str(value)
+                for key, value in (payload.get('title_map') or {}).items()
+                if str(key).isdigit() and str(value).strip()
+            },
         )
         with self.lock:
             self.tasks.append(task)
@@ -654,6 +713,8 @@ class JobManager:
             return
 
         GuiDownloader.tracker = tracker
+        _ACTIVE_TITLES.clear()
+        _ACTIVE_TITLES.update(task.title_map or {})
         results: list[Any] = []
         try:
             option = create_option(task.option) if task.option else JmOption.default()
@@ -759,6 +820,7 @@ class JobManager:
         finally:
             jm_logger.removeHandler(handler)
             GuiDownloader.tracker = None
+            _ACTIVE_TITLES.clear()
 
     def pause(self, task_id: str = '') -> None:
         task = self._target(task_id)
@@ -1148,5 +1210,6 @@ class JobManager:
             self.cover_cache.clear()
         self.cover_cache[cache_key] = content
         return content
+
 
 

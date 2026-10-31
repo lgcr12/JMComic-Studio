@@ -903,6 +903,7 @@ HTML = r'''<!doctype html>
     let running = false, paused = false, pollTimer = null, seenLogs = 0;
     let outputFormat = 'jpg', searchCategory = 'all', searchSource = 'all', albumData = null, quality = 100;
     let mergedSupplement = [];
+    let mergedTitles = {};
     let pdfOrientation = 'auto', skipBad = true, keepRaw = false;
     let islandState = 'idle', hideTimer = null, lastLogs = [];
 
@@ -1175,6 +1176,8 @@ HTML = r'''<!doctype html>
         const data = await fetch(url).then((r) => r.json());
         if (data.error) throw new Error(data.error);
         mergedSupplement = data.supplement || [];
+        mergedTitles = {};
+        (data.episodes || []).forEach((ep) => { if (ep.display && ep.display !== ep.name) mergedTitles[ep.index] = ep.display; });
         const primary = data.primary || {};
         const secondary = data.secondary || {};
         if (!albumData && primary.title) {
@@ -1223,7 +1226,7 @@ HTML = r'''<!doctype html>
         $('log').innerHTML = '<div class="log-row warn"><span class="lt">--:--:--</span><span class="lv">WARNING</span><span class="lm">请至少填写一个本子或章节，或先合并出补充章节。</span></div>';
         return;
       }
-      const payload = { albums, photos, option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: Boolean(isPreview), quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw, supplement: mergedSupplement, supplement_title: (albumData && albumData.title) || '' };
+      const payload = { albums, photos, option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: Boolean(isPreview), quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw, supplement: mergedSupplement, title_map: mergedTitles, supplement_title: (albumData && albumData.title) || '' };
       const response = await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
       const data = await response.json();
       if (!response.ok) {
@@ -1245,7 +1248,7 @@ HTML = r'''<!doctype html>
         $('log').innerHTML = '<div class="log-row warn"><span class="lt">--:--:--</span><span class="lv">WARNING</span><span class="lm">还没有补充章节：先点「合并补章」比对两边。</span></div>';
         return;
       }
-      const payload = { albums: '', photos: '', option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: false, quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw, supplement: mergedSupplement, supplement_title: (albumData && albumData.title) || '' };
+      const payload = { albums: '', photos: '', option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: false, quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw, supplement: mergedSupplement, title_map: mergedTitles, supplement_title: (albumData && albumData.title) || '' };
       const response = await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
       const data = await response.json();
       if (!response.ok) {
@@ -1305,7 +1308,7 @@ HTML = r'''<!doctype html>
       $('albums').value = ''; $('photos').value = ''; $('option').value = ''; $('output').value = '下载';
       $('chapterBox').innerHTML = ''; $('chapterMeta').textContent = '未加载'; $('chapterHint').textContent = '未选择时下载全部章节';
       $('albumCard').classList.remove('show'); albumData = null;
-      mergedSupplement = []; $('extraUrl').value = '';
+      mergedSupplement = []; mergedTitles = {}; $('extraUrl').value = '';
       $('mergeInfo').textContent = '填 JM 作品 ID 后点「合并补章」，会按标题自动匹配补充源；也可手动填 ID。';
       document.querySelector('input[name="scope"][value="all"]').checked = true;
       outputFormat = 'jpg'; document.querySelectorAll('#formatToggle button').forEach((b) => b.classList.toggle('active', b.dataset.format === 'jpg'));
@@ -1649,6 +1652,8 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
+
 
 
 
