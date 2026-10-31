@@ -517,27 +517,31 @@ def download_supplement(task: Task, tracker: ProgressTracker, control: Any) -> t
         tracker.current_chapter = chapter_dir.name
         tracker.current_index = int(entry.get('index') or 0)
         ok = 0
-        for index, url in enumerate(urls, start=1):
+        def fetch_one(index: int, url: str) -> int:
             if control is not None and control.is_cancelled:
-                break
+                return 0
+            tracker.wait_if_paused()
             target = chapter_dir / f'{index:05d}.jpg'
             if target.exists() and target.stat().st_size > 0:
-                ok += 1
                 with tracker.lock:
                     tracker.images_done += 1
-                continue
+                return 1
             try:
                 payload = fetch_image(url)
                 target.write_bytes(payload)
-                ok += 1
                 with tracker.lock:
                     tracker.images_done += 1
                     tracker.current_image += 1
                 tracker.add_bytes(len(payload))
-                time.sleep(0.15)
+                return 1
             except Exception as error:  # noqa: BLE001
                 task.add_log(f'{time.strftime("%H:%M:%S")}  WARNING  图片失败：{url}，{error}')
-            tracker.wait_if_paused()
+                return 0
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(fetch_one, index, url) for index, url in enumerate(urls, start=1)]
+            for future in as_completed(futures):
+                ok += future.result()
         if ok:
             chapters += 1
             images += ok

@@ -40,39 +40,58 @@ def _http(url: str, *, referer: str = BASE + '/', data: Optional[dict[str, str]]
     return resp.text
 
 
-def fetch_image(url: str) -> bytes:
-    """Fetch one image with retries and CDN host fallback.
+_CDN_HOSTS = ['img.nnpic.xyz', 'p4.nnpic.xyz', 'p6.nnpic.xyz', 'p8.nnpic.xyz', 'p9.nnpic.xyz']
+_GOOD_HOST: list[str] = []
+_LOCAL = __import__('threading').local()
 
-    该站图片 CDN 在连续请求时会重置连接，因此失败后换域名重试，并随机退避。
+
+def _session():
+    """curl_cffi Session is not thread-safe: keep one per worker thread."""
+    session = getattr(_LOCAL, 'session', None)
+    if session is None:
+        from curl_cffi import requests as creq
+        session = creq.Session(impersonate='chrome')
+        _LOCAL.session = session
+    return session
+
+
+def _host_url(url: str, host: str) -> str:
+    return re.sub(r'//[^/]+/', f'//{host}/', url, count=1)
+
+
+def fetch_image(url: str) -> bytes:
+    """Fetch one image, reusing TLS connections and preferring the host that worked.
+
+    该站多个图片域名里有一部分会直接断开 SSL，记住可用域名可以避免每张图都重试坏域名。
     """
-    import random
     import time
 
-    from curl_cffi import requests as creq
-
-    hosts = ['img.nnpic.xyz', 'p4.nnpic.xyz', 'p6.nnpic.xyz', 'p8.nnpic.xyz', 'p9.nnpic.xyz']
-    candidates = [url]
-    for host in hosts:
-        swapped = re.sub(r'//[^/]+/', f'//{host}/', url, count=1)
-        if swapped not in candidates:
-            candidates.append(swapped)
+    candidates: list[str] = []
+    for host in list(_GOOD_HOST) + _CDN_HOSTS:
+        target = _host_url(url, host)
+        if target not in candidates:
+            candidates.append(target)
 
     last_error: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(3):
         target = candidates[attempt % len(candidates)]
         try:
-            resp = creq.get(
+            resp = _session().get(
                 target,
                 headers={'User-Agent': UA, 'Referer': BASE + '/', 'Accept': 'image/avif,image/webp,image/*,*/*;q=0.8'},
-                impersonate='chrome',
-                timeout=45,
+                timeout=20,
             )
             if resp.status_code == 200 and resp.content:
+                host = re.match(r'https?://([^/]+)/', target)
+                if host:
+                    name = host.group(1)
+                    if name not in _GOOD_HOST:
+                        _GOOD_HOST[:] = [name]
                 return bytes(resp.content)
             last_error = RuntimeError(f'HTTP {resp.status_code}')
         except Exception as error:  # noqa: BLE001
             last_error = error
-        time.sleep(0.6 + random.random() * 1.2)
+        time.sleep(0.15)
     raise RuntimeError(f'图片获取失败：{last_error}')
 
 
