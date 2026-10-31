@@ -1084,13 +1084,21 @@ HTML = r'''<!doctype html>
       }).join('');
       $('searchResults').querySelectorAll('.result-item').forEach((node) => node.addEventListener('click', () => {
         const source = node.dataset.source || 'jm';
+        $('searchResults').querySelectorAll('.result-item').forEach((other) => other.classList.toggle('selected', other === node));
         if (source === 'jm') {
           $('albums').value = node.dataset.id;
-        } else {
-          $('extraUrl').value = node.dataset.id;
+          refreshCounts();
+          loadAlbum();
+          if ($('extraUrl').value.trim()) mergeAlbum();
+          return;
         }
-        refreshCounts();
-        loadAlbum();
+        $('extraUrl').value = node.dataset.id;
+        const jmId = split($('albums').value).find((x) => /^\d+$/.test(x));
+        if (jmId) {
+          mergeAlbum();
+        } else {
+          $('mergeInfo').textContent = `已选择补充源「${node.dataset.title || node.dataset.id}」(#${node.dataset.id})，再填 JM 作品 ID 后点「合并补章」。`;
+        }
       }));
     };
 
