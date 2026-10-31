@@ -458,7 +458,7 @@ def download_supplement(task: Task, tracker: ProgressTracker, control: Any) -> t
         return 0, 0
     from .site_sources import fetch_image
 
-    root = Path(task.output or '.').resolve() / (task.supplement_title or '补充章节')
+    root = Path(task.output or '.').resolve() / safe_name(task.supplement_title, '补充章节')
     root.mkdir(parents=True, exist_ok=True)
     chapters = 0
     images = 0
