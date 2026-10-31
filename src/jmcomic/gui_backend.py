@@ -981,7 +981,28 @@ class JobManager:
         primary_max = max(primary_issues) if primary_issues else 0
 
         supplement: list[dict[str, Any]] = []
+        titled = 0
         if secondary:
+            issue_titles: dict[int, str] = {}
+            for ep in secondary.get('episodes', []):
+                issues = parse_issues(ep.get('name', ''))
+                if issues and issues[0] not in issue_titles:
+                    issue_titles[issues[0]] = ep.get('name', '')
+
+            # 用补充源的标题回填主源里只有数字的章节名
+            merged_episodes: list[dict[str, Any]] = []
+            for ep in episodes:
+                name = str(ep.get('name', '') or '').strip()
+                issues = parse_issues(name)
+                display = name
+                if secondary and issues and issues[0] in issue_titles:
+                    title = issue_titles[issues[0]]
+                    if len(normalize_title(name)) <= 4 and title:
+                        display = title
+                        titled += 1
+                merged_episodes.append({**ep, 'name': name, 'display': display})
+            episodes = merged_episodes
+
             seen_extra: set[int] = set()
             for ep in secondary.get('episodes', []):
                 issues = parse_issues(ep.get('name', ''))
@@ -1006,6 +1027,7 @@ class JobManager:
             'secondary_count': len(secondary.get('episodes', [])) if secondary else 0,
             'supplement_count': len(supplement),
             'auto_matched': bool(matched),
+            'titled': titled,
         }
         return {
             'primary': primary,
