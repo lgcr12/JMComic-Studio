@@ -801,6 +801,7 @@ HTML = r'''<!doctype html>
             <div class="buttons">
               <button id="clearConfig" class="btn btn-ghost" type="button">清空配置</button>
               <button id="preview" class="btn btn-ghost" type="button">预览任务</button>
+              <button id="supplementOnly" class="btn btn-ghost" type="button">只补缺章</button>
               <button id="start" class="btn btn-primary" type="button">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13"></path><path d="m13 6 6 6-6 6"></path></svg>
                 <span id="startLabel">开始下载</span>
@@ -1168,7 +1169,9 @@ HTML = r'''<!doctype html>
         mergedSupplement = data.supplement || [];
         const primary = data.primary || {};
         const secondary = data.secondary || {};
-        const stats = data.stats || {};
+        if (!albumData && primary.title) {
+          albumData = { title: primary.title, chapters: primary.chapters || 0, pages: primary.pages || 0, id: primary.id, source: 'jm', source_label: primary.source_label || 'JM' };
+        }
         $('mergeInfo').innerHTML = `主源 ${escapeHtml(primary.source_label || 'JM')} <b>${primary.chapters || 0}</b> 章 · 补充源 ${escapeHtml(secondary.source_label || '肉漫天堂')} <b>${secondary.chapters || 0}</b> 章 · 需补 <b>${mergedSupplement.length}</b> 章`;
         if (mergedSupplement.length) {
           const preview = mergedSupplement.slice(0, 3).map((x) => `第${x.index}话`).join('、');
@@ -1196,11 +1199,33 @@ HTML = r'''<!doctype html>
     const submit = async (isPreview) => {
       if (running) return;
       const albums = $('albums').value, photos = $('photos').value;
-      if (!split(albums).length && !split(photos).length) {
-        $('log').innerHTML = '<div class="log-row warn"><span class="lt">--:--:--</span><span class="lv">WARNING</span><span class="lm">请至少填写一个本子或章节。</span></div>';
+      if (!split(albums).length && !split(photos).length && !mergedSupplement.length) {
+        $('log').innerHTML = '<div class="log-row warn"><span class="lt">--:--:--</span><span class="lv">WARNING</span><span class="lm">请至少填写一个本子或章节，或先合并出补充章节。</span></div>';
         return;
       }
       const payload = { albums, photos, option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: Boolean(isPreview), quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw, supplement: mergedSupplement, supplement_title: (albumData && albumData.title) || '' };
+      const response = await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+      const data = await response.json();
+      if (!response.ok) {
+        $('log').innerHTML = `<div class="log-row err"><span class="lt">--:--:--</span><span class="lv">ERROR</span><span class="lm">${escapeHtml(data.error)}</span></div>`;
+        return;
+      }
+      islandState = 'idle';
+      seenLogs = 0;
+      $('doneCard').classList.remove('show');
+      setRunning(true, false);
+      islandRun(null);
+      poll();
+      if (!pollTimer) pollTimer = setInterval(poll, 1500);
+    };
+
+    const submitSupplementOnly = async () => {
+      if (running) return;
+      if (!mergedSupplement.length) {
+        $('log').innerHTML = '<div class="log-row warn"><span class="lt">--:--:--</span><span class="lv">WARNING</span><span class="lm">还没有补充章节：先点「合并补章」比对两边。</span></div>';
+        return;
+      }
+      const payload = { albums: '', photos: '', option: $('option').value.trim(), output: $('output').value.trim(), format: outputFormat, dry_run: false, quality, pdf_orientation: pdfOrientation, skip_bad: skipBad, keep_raw: keepRaw, supplement: mergedSupplement, supplement_title: (albumData && albumData.title) || '' };
       const response = await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
       const data = await response.json();
       if (!response.ok) {
@@ -1252,6 +1277,7 @@ HTML = r'''<!doctype html>
     $('searchQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchByName(); });
     $('start').addEventListener('click', () => submit(false));
     $('preview').addEventListener('click', () => submit(true));
+    $('supplementOnly').addEventListener('click', submitSupplementOnly);
     $('pause').addEventListener('click', () => postAction('/api/pause').then(poll));
     $('resume').addEventListener('click', () => postAction('/api/resume').then(poll));
     $('cancel').addEventListener('click', () => postAction('/api/cancel').then(poll));
