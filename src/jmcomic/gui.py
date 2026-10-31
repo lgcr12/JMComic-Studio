@@ -1190,6 +1190,8 @@ HTML = r'''<!doctype html>
         const matchNote = data.matched ? `自动匹配到「${escapeHtml(data.matched.title)}」(#${escapeHtml(data.matched.id)})` : '';
         const titled = (data.stats || {}).titled || 0;
         $('mergeInfo').innerHTML = `${matchNote ? matchNote + ' · ' : ''}主源 ${escapeHtml(primary.source_label || 'JM')} <b>${primary.chapters || 0}</b> 章 · 补充源 ${escapeHtml(secondary.source_label || '肉漫天堂')} <b>${secondary.chapters || 0}</b> 章 · 需补 <b>${mergedSupplement.length}</b> 章${titled ? ` · 回填标题 <b>${titled}</b> 条` : ''}`;
+        const warn = (data.stats || {}).alignment_warning;
+        if (warn) { $('mergeInfo').textContent += ' · ' + warn; }
         if (mergedSupplement.length) {
           const preview = mergedSupplement.slice(0, 3).map((x) => `第${x.index}话`).join('、');
           $('mergeInfo').textContent += `（${preview}${mergedSupplement.length > 3 ? ' 等' : ''}）`;
@@ -1652,6 +1654,7 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
 
 
 

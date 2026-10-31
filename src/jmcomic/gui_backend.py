@@ -64,19 +64,11 @@ def pages_iter(page: Any):
 _NORMALIZE_RE = re.compile(r'[\s\-_·・:：!！?？,，.。()（）\[\]【】「」『』/\\|]+')
 
 
-_EXTRA_TRAD = '麗華夢靈體術師學園兒國慶賀歲豐獲勝敗壞處罰獎勵願實現專業餘額'
-_EXTRA_SIMP = '丽华梦灵体术师学园儿国庆贺岁丰获胜败坏处罚奖励愿实现专业余额'
-
-_TRAD_TO_SIMP = str.maketrans(
-    _EXTRA_TRAD
-    + '教學祕密漫畫連載話說閱讀點擊喜歡觀看繁體這為與們個時間開關閉號'
-    + '導覽選擇確認識別錯誤載入整理資料夾輸出目錄章節圖片檔案無雙愛戀龍鳳'
-    + '爭奪戰國語動態繪畫升級進度結束總頁數作者名的',
-    _EXTRA_SIMP
-    + '教学秘密漫画连载话说阅读点击喜欢观看繁体这为与们个时间开关闭号'
-    + '导览选择确认识别错误载入整理资料夹输出目录章节图片档案无双爱恋龙凤'
-    + '争夺战国语动态绘画升级进度结束总页数作者名的',
-)
+_VARIANT_PAIRS = {'姊': '姐', '妳': '你', '裡': '里', '臺': '台', '牠': '它', '麼': '么', '佔': '占', '傢': '家'}
+_TRAD_TO_SIMP = str.maketrans({
+    **_VARIANT_PAIRS,
+    **dict(zip('麗華夢靈體術師學園兒國慶賀歲豐獲勝敗壞處罰獎勵願實現專業餘額', '丽华梦灵体术师学园儿国庆贺岁丰获胜败坏处罚奖励愿实现专业余额')),
+})
 
 
 def normalize_title(title: str) -> str:
@@ -1094,42 +1086,68 @@ class JobManager:
         self.album_cache[album_id] = (now, data)
         return data
 
-    def _match_extra(self, title: str, source_key: str) -> Optional[dict[str, Any]]:
-        """Best-effort title match on the secondary source."""
+    def _match_extra(self, title: str, source_key: str, primary_issues: Optional[set[int]] = None) -> Optional[dict[str, Any]]:
+        """Match the same comic on the secondary source by title similarity + issue overlap."""
+        from difflib import SequenceMatcher
+
         from .site_sources import get_source
 
         impl = get_source(source_key)
         if impl is None or not title:
             return None
-        base_title = re.split(r'[/|｜]', str(title))[0].strip()
+        base_title = re.split(r'[/|｜\s]', str(title))[0].strip() or str(title).strip()
+        queries: list[str] = []
+        for candidate in [str(title).strip(), base_title, normalize_title(base_title)]:
+            if candidate and candidate not in queries:
+                queries.append(candidate)
         candidates: list[dict[str, Any]] = []
-        for query in dict.fromkeys([base_title, str(title).strip()]):
-            if not query:
-                continue
+        for query in queries:
             try:
                 candidates.extend(impl.search(query))
             except Exception:
                 continue
         if not candidates:
             return None
+
         target = normalize_title(base_title)
-        best = None
-        best_score = 0
+        scored: list[tuple[float, dict[str, Any]]] = []
+        seen: set[str] = set()
         for item in candidates:
+            comic_id = str(item.get('id'))
+            if comic_id in seen:
+                continue
+            seen.add(comic_id)
             name = normalize_title(item.get('title', ''))
             if not name:
                 continue
+            ratio = SequenceMatcher(None, target, name).ratio()
             if name == target:
-                score = 3
+                ratio = 1.0
             elif name in target or target in name:
-                score = 2
-            elif abs(len(name) - len(target)) <= 2 and \
-                    len(set(name) & set(target)) / max(1, len(set(target))) >= 0.8:
-                score = 1
-            else:
-                continue
-            if score > best_score:
-                best, best_score = item, score
+                ratio = max(ratio, 0.9)
+            if ratio >= 0.6:
+                scored.append((ratio, item))
+        if not scored:
+            return None
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        # 标题相近的候选可能不止一个，再用章节话号重合度确认
+        best: Optional[dict[str, Any]] = None
+        best_score = 0.0
+        for ratio, item in scored[:5]:
+            overlap = 0.0
+            if primary_issues:
+                try:
+                    album = self.album(str(item['id']), source_key)
+                    issues = {_chapter_issue(ep.get('name', '')) for ep in album.get('episodes', [])}
+                    issues.discard(10 ** 9)
+                    if issues:
+                        overlap = len(issues & primary_issues) / max(1, min(len(issues), len(primary_issues)))
+                except Exception:
+                    overlap = 0.0
+            score = ratio + overlap
+            if (overlap >= 0.4 or ratio >= 0.85) and score > best_score:
+                best, best_score = dict(item), score
         return best
 
     def merge(self, jm_id: str, extra_source: str = 'rmtt', extra_id: str = '') -> dict[str, Any]:
@@ -1141,9 +1159,20 @@ class JobManager:
         jm_id = str(jm_id or '').strip()
         extra_id = str(extra_id or '').strip()
         primary = self.album(jm_id, 'jm') if jm_id.isdigit() else None
+        episodes = list(primary.get('episodes', [])) if primary else []
+        primary_issues: set[int] = set()
+        for ep in episodes:
+            primary_issues.add(_chapter_issue(ep.get('name', '')))
+        # 主源章节名全为空时无法按话号对齐，硬补会把所有章节当缺失
+        known = sum(1 for issue in primary_issues if issue != 10 ** 9)
+        coverage = known / max(1, len(episodes)) if episodes else 0.0
+        alignment_warning = ''
+        if episodes and coverage < 0.8:
+            alignment_warning = '主源章节名缺失较多，无法可靠比对缺失章节，已跳过补章'
+
         matched = None
         if not extra_id and primary:
-            matched = self._match_extra(primary.get('title', ''), extra_source)
+            matched = self._match_extra(primary.get('title', ''), extra_source, primary_issues)
             if matched:
                 extra_id = matched['id']
         secondary = None
@@ -1154,14 +1183,11 @@ class JobManager:
                 secondary = None
 
         episodes = list(primary.get('episodes', [])) if primary else []
-        primary_issues: set[int] = set()
-        for ep in episodes:
-            primary_issues.update(parse_issues(ep.get('name', '')))
         primary_max = max(primary_issues) if primary_issues else 0
 
         supplement: list[dict[str, Any]] = []
         titled = 0
-        if secondary:
+        if secondary and not alignment_warning:
             issue_titles: dict[int, str] = {}
             for ep in secondary.get('episodes', []):
                 issues = parse_issues(ep.get('name', ''))
@@ -1207,6 +1233,7 @@ class JobManager:
             'supplement_count': len(supplement),
             'auto_matched': bool(matched),
             'titled': titled,
+            'alignment_warning': alignment_warning,
         }
         return {
             'primary': primary,
@@ -1248,6 +1275,8 @@ class JobManager:
             self.cover_cache.clear()
         self.cover_cache[cache_key] = content
         return content
+
+
 
 
 
