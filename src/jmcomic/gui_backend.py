@@ -688,6 +688,20 @@ class JobManager:
                         task.add_log(
                             f'{time.strftime("%H:%M:%S")}  INFO  Venera 压缩包已更新：{zip_path.name}（新增 {packed} 张）'
                         )
+                    if packed and not task.keep_raw:
+                        # 只保留 ZIP：图片已进压缩包，删掉临时目录
+                        import shutil
+                        root_dir = extra_dirs[0].parent
+                        for _ in range(4):
+                            shutil.rmtree(root_dir, ignore_errors=True)
+                            if not root_dir.exists():
+                                break
+                            time.sleep(0.3)
+                        task.add_log(
+                            f'{time.strftime("%H:%M:%S")}  INFO  已清理原始图片，仅保留 ZIP'
+                            if not root_dir.exists() else
+                            f'{time.strftime("%H:%M:%S")}  WARNING  原始图片目录未能删除：{root_dir}'
+                        )
 
             image_paths: list[Path] = []
             for item in results:
@@ -703,6 +717,20 @@ class JobManager:
                 tracker.phase = '整理 Venera 目录'
                 comics, images = export_venera(results, task.output or os.getcwd(), keep_raw=task.keep_raw)
                 task.add_log(f'{time.strftime("%H:%M:%S")}  INFO  Venera 导入目录已更新：{comics} 本，{images} 张图片')
+
+            # 补章只保留 ZIP：放在最后统一清理，避免早期的文件句柄占用导致删不掉
+            if task.supplement and not task.keep_raw and not control.is_cancelled:
+                supp_root = Path(task.output or '.').resolve() / safe_name(task.supplement_title, '补充章节')
+                for _ in range(6):
+                    if not supp_root.exists():
+                        break
+                    import shutil
+                    shutil.rmtree(supp_root, ignore_errors=True)
+                    time.sleep(0.25)
+                if supp_root.exists():
+                    task.add_log(f'{time.strftime("%H:%M:%S")}  WARNING  原始图片目录未能删除：{supp_root}')
+                else:
+                    task.add_log(f'{time.strftime("%H:%M:%S")}  INFO  已清理原始图片，仅保留 ZIP')
             if control.is_cancelled:
                 task.status = 'canceled'
                 task.error = '任务已取消'
