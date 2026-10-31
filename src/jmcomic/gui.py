@@ -707,14 +707,14 @@ HTML = r'''<!doctype html>
               <div class="row-2" style="margin-top:10px">
                 <div class="field">
                   <label for="extraUrl">补充源作品</label>
-                  <input id="extraUrl" type="text" placeholder="肉漫天堂 ID 或 链接">
+                  <input id="extraUrl" type="text" placeholder="留空则按标题自动匹配">
                 </div>
                 <div class="field">
                   <label>&nbsp;</label>
                   <button id="mergeBtn" class="mini-btn" type="button" style="width:100%">合并补章</button>
                 </div>
               </div>
-              <div id="mergeInfo" class="hint" style="margin-top:8px">填写 JM 作品 ID 与补充源 ID，点「合并补章」后缺章会自动从补充源补齐。</div>
+              <div id="mergeInfo" class="hint" style="margin-top:8px">填 JM 作品 ID 后点「合并补章」，会按标题自动匹配补充源；也可手动填 ID。</div>
               <div class="row-2" style="margin-top:10px">
                 <div class="field">
                   <label for="option">选择文件（可选）</label>
@@ -1161,10 +1161,10 @@ HTML = r'''<!doctype html>
       const extraRaw = $('extraUrl').value.trim();
       const extraId = (extraRaw.match(/(\d{3,})/) || [])[1] || '';
       if (!jmId) { $('mergeInfo').textContent = '先在上方填入 JM 作品 ID'; return; }
-      if (!extraId) { $('mergeInfo').textContent = '请在「补充源作品」里填肉漫天堂的作品 ID 或链接'; return; }
-      $('mergeInfo').textContent = '正在比对两边的章节…';
+      $('mergeInfo').textContent = extraId ? '正在比对两边的章节…' : '未填补充源 ID，正在按标题自动匹配…';
       try {
-        const data = await fetch(`/api/merge?id=${encodeURIComponent(jmId)}&source=rmtt&extra=${encodeURIComponent(extraId)}`).then((r) => r.json());
+        const url = `/api/merge?id=${encodeURIComponent(jmId)}&source=rmtt${extraId ? `&extra=${encodeURIComponent(extraId)}` : ''}`;
+        const data = await fetch(url).then((r) => r.json());
         if (data.error) throw new Error(data.error);
         mergedSupplement = data.supplement || [];
         const primary = data.primary || {};
@@ -1172,7 +1172,12 @@ HTML = r'''<!doctype html>
         if (!albumData && primary.title) {
           albumData = { title: primary.title, chapters: primary.chapters || 0, pages: primary.pages || 0, id: primary.id, source: 'jm', source_label: primary.source_label || 'JM' };
         }
-        $('mergeInfo').innerHTML = `主源 ${escapeHtml(primary.source_label || 'JM')} <b>${primary.chapters || 0}</b> 章 · 补充源 ${escapeHtml(secondary.source_label || '肉漫天堂')} <b>${secondary.chapters || 0}</b> 章 · 需补 <b>${mergedSupplement.length}</b> 章`;
+        if (!secondary) {
+          $('mergeInfo').textContent = '没有找到对应的补充源作品，可在「补充源作品」里手动填入 ID。';
+          return;
+        }
+        const matchNote = data.matched ? `自动匹配到「${escapeHtml(data.matched.title)}」(#${escapeHtml(data.matched.id)})` : '';
+        $('mergeInfo').innerHTML = `${matchNote ? matchNote + ' · ' : ''}主源 ${escapeHtml(primary.source_label || 'JM')} <b>${primary.chapters || 0}</b> 章 · 补充源 ${escapeHtml(secondary.source_label || '肉漫天堂')} <b>${secondary.chapters || 0}</b> 章 · 需补 <b>${mergedSupplement.length}</b> 章`;
         if (mergedSupplement.length) {
           const preview = mergedSupplement.slice(0, 3).map((x) => `第${x.index}话`).join('、');
           $('mergeInfo').textContent += `（${preview}${mergedSupplement.length > 3 ? ' 等' : ''}）`;
@@ -1286,7 +1291,7 @@ HTML = r'''<!doctype html>
       $('chapterBox').innerHTML = ''; $('chapterMeta').textContent = '未加载'; $('chapterHint').textContent = '未选择时下载全部章节';
       $('albumCard').classList.remove('show'); albumData = null;
       mergedSupplement = []; $('extraUrl').value = '';
-      $('mergeInfo').textContent = '填写 JM 作品 ID 与补充源 ID，点「合并补章」后缺章会自动从补充源补齐。';
+      $('mergeInfo').textContent = '填 JM 作品 ID 后点「合并补章」，会按标题自动匹配补充源；也可手动填 ID。';
       document.querySelector('input[name="scope"][value="all"]').checked = true;
       outputFormat = 'jpg'; document.querySelectorAll('#formatToggle button').forEach((b) => b.classList.toggle('active', b.dataset.format === 'jpg'));
       $('infoFormat').textContent = 'JPG';
@@ -1629,6 +1634,7 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
 
 
 

@@ -910,6 +910,43 @@ class JobManager:
         self.album_cache[album_id] = (now, data)
         return data
 
+    def _match_extra(self, title: str, source_key: str) -> Optional[dict[str, Any]]:
+        """Best-effort title match on the secondary source."""
+        from .site_sources import get_source
+
+        impl = get_source(source_key)
+        if impl is None or not title:
+            return None
+        base_title = re.split(r'[/|｜]', str(title))[0].strip()
+        candidates: list[dict[str, Any]] = []
+        for query in dict.fromkeys([base_title, str(title).strip()]):
+            if not query:
+                continue
+            try:
+                candidates.extend(impl.search(query))
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        target = normalize_title(base_title)
+        best = None
+        best_score = 0
+        for item in candidates:
+            name = normalize_title(item.get('title', ''))
+            if not name:
+                continue
+            if name == target:
+                score = 3
+            elif name in target or target in name:
+                score = 2
+            elif len(set(name) & set(target)) / max(1, len(set(target))) >= 0.6:
+                score = 1
+            else:
+                continue
+            if score > best_score:
+                best, best_score = item, score
+        return best
+
     def merge(self, jm_id: str, extra_source: str = 'rmtt', extra_id: str = '') -> dict[str, Any]:
         """Merge chapter lists by issue number, primary source first.
 
@@ -919,6 +956,11 @@ class JobManager:
         jm_id = str(jm_id or '').strip()
         extra_id = str(extra_id or '').strip()
         primary = self.album(jm_id, 'jm') if jm_id.isdigit() else None
+        matched = None
+        if not extra_id and primary:
+            matched = self._match_extra(primary.get('title', ''), extra_source)
+            if matched:
+                extra_id = matched['id']
         secondary = None
         if extra_id:
             try:
@@ -957,10 +999,12 @@ class JobManager:
             'primary_max_issue': primary_max,
             'secondary_count': len(secondary.get('episodes', [])) if secondary else 0,
             'supplement_count': len(supplement),
+            'auto_matched': bool(matched),
         }
         return {
             'primary': primary,
             'secondary': secondary,
+            'matched': matched,
             'episodes': episodes,
             'supplement': supplement,
             'stats': stats,
